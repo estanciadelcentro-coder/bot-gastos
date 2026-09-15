@@ -1,0 +1,5 @@
+node_modules/
+.env
+google-credentials.json
+service-account*.json
+*-key.json
