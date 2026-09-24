@@ -176,8 +176,9 @@ async function interpretar(mensaje, historialUsuario) {
     max_tokens: 700,
     system: `${SYSTEM_PROMPT}\n\nAhora es ${fechaHoyAR()} (zona horaria de Argentina).`,
     messages: mensajes,
-  });
+  }, { timeout: 30000 });
   const bloque = resp.content.find((b) => b.type === 'text');
+  console.log('🕵️ [2] Claude respondió:', bloque.text);
   return extraerJSON(bloque.text);
 }
 
@@ -228,10 +229,12 @@ async function agendarEvento(ev) {
     };
   }
 
-  await calendar.events.insert({
+  console.log('🕵️ [3] Creando evento en calendario:', CALENDAR_ID, JSON.stringify(evento));
+  const creado = await calendar.events.insert({
     calendarId: CALENDAR_ID,
     requestBody: evento,
-  });
+  }, { timeout: 20000 });
+  console.log('🕵️ [4] Evento creado OK:', creado.data.htmlLink);
 }
 
 function sumarUnaHora(hhmm) {
@@ -288,11 +291,13 @@ function formatearFechaHora(iso) {
 
 // ── WHATSAPP ──
 async function enviarWhatsApp(to, body) {
-  await axios.post(
+  if (!body || !String(body).trim()) body = '🤔 Algo no me cerró, ¿me lo repetís?';
+  const r = await axios.post(
     `https://api.ultramsg.com/${ULTRAMSG_INSTANCE_ID}/messages/chat`,
     null,
-    { params: { token: ULTRAMSG_TOKEN, to, body } }
+    { params: { token: ULTRAMSG_TOKEN, to, body }, timeout: 20000 }
   );
+  console.log('🕵️ [5] UltraMsg contestó:', JSON.stringify(r.data));
 }
 
 // ── RUTAS ──
@@ -301,15 +306,18 @@ app.get('/', (req, res) => res.send('Bot de gastos + agenda funcionando ✅'));
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200); // respondemos ya para que UltraMsg no reintente
 
+  let numero = null;
   try {
     const data = req.body.data;
+    console.log('🕵️ [0] Llegó webhook:', data ? `tipo=${data.type} fromMe=${data.fromMe} de=${data.from}` : 'sin datos');
     if (!data || data.fromMe || data.type !== 'chat') return;
 
-    const numero = String(data.from).split('@')[0];
+    numero = String(data.from).split('@')[0];
     const nombre = allowedUsers[numero];
-    if (!nombre) return; // número no autorizado → se ignora
+    if (!nombre) { console.log('🕵️ Número no autorizado:', numero); return; }
 
     const mensajeUsuario = data.body || '';
+    console.log('🕵️ [1] Llegó mensaje de', nombre, ':', mensajeUsuario);
 
     // Traemos el contexto de los mensajes anteriores de esta persona
     const contexto = obtenerHistorial(numero);
@@ -318,21 +326,36 @@ app.post('/webhook', async (req, res) => {
     let respuesta = r.respuesta;
 
     if (r.completo) {
-      if (r.accion === 'gasto') {
-        await anotarGasto(r.gasto, nombre);
-      } else if (r.accion === 'agendar') {
-        await agendarEvento(r.evento);
-      } else if (r.accion === 'consultar') {
-        respuesta = await consultarAgenda(r.consulta);
+      try {
+        if (r.accion === 'gasto') {
+          await anotarGasto(r.gasto, nombre);
+        } else if (r.accion === 'agendar') {
+          await agendarEvento(r.evento);
+        } else if (r.accion === 'consultar') {
+          respuesta = await consultarAgenda(r.consulta);
+        }
+      } catch (accionErr) {
+        // En vez de quedar mudo, avisamos el motivo por WhatsApp
+        console.error('Error en la acción:', accionErr.message);
+        respuesta = `⚠️ No pude completar la acción. Motivo: ${accionErr.message}`;
       }
     }
 
     // Guardamos este intercambio en la memoria de la persona
-    guardarEnHistorial(numero, mensajeUsuario, respuesta);
+    // (se guarda en formato JSON para que Claude siga respondiendo en su formato)
+    guardarEnHistorial(numero, mensajeUsuario, JSON.stringify({ ...r, respuesta }));
 
     await enviarWhatsApp(numero, respuesta);
   } catch (err) {
     console.error('Error procesando mensaje:', err.message);
+    // Avisamos también por WhatsApp para no quedar mudos
+    if (numero) {
+      try {
+        await enviarWhatsApp(numero, `⚠️ Tuve un problema: ${err.message}`);
+      } catch (e2) {
+        console.error('Error avisando por WhatsApp:', e2.message);
+      }
+    }
   }
 });
 
