@@ -1,10 +1,12 @@
-// ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 //  Bot de Gastos + Agenda por WhatsApp — Gabi
 //  Recibe mensajes de UltraMsg → los interpreta con Claude →
 //  segun el caso: anota un gasto en Google Sheets, agenda un
 //  evento en Google Calendar, o consulta la agenda.
+//  Ahora con MEMORIA: recuerda los ultimos mensajes de cada
+//  persona para entender el contexto (ej: responder "1 hora").
 //  Siempre responde por WhatsApp.
-// ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
 const express = require('express');
 const axios = require('axios');
@@ -36,6 +38,39 @@ ALLOWED.split(',').forEach((pair) => {
   if (num && num.trim()) allowedUsers[num.trim()] = (name || '').trim();
 });
 
+// ── MEMORIA DE CONVERSACIÓN ──
+// Guardamos los últimos mensajes de cada persona en la memoria del
+// servidor. Sirve para entender el contexto (ej: si el bot pregunta
+// "¿1 hora o 30 min?" y la persona responde "1 hora", el bot ya sabe
+// de qué se trata). Nota: si Railway reinicia el bot, esta memoria se
+// borra (empieza de cero); para una charla seguida funciona muy bien.
+const historial = {};                 // { numero: { mensajes: [...], ts: 123 } }
+const MAX_MENSAJES = 10;              // recuerda los últimos 10 mensajes por persona
+const MINUTOS_VIGENCIA = 30;         // si pasaron +30 min sin hablar, arranca contexto nuevo
+
+function obtenerHistorial(numero) {
+  const h = historial[numero];
+  if (!h) return [];
+  // Si la última charla fue hace mucho, la olvidamos (contexto viejo)
+  if (Date.now() - h.ts > MINUTOS_VIGENCIA * 60 * 1000) {
+    delete historial[numero];
+    return [];
+  }
+  return h.mensajes;
+}
+
+function guardarEnHistorial(numero, mensajeUsuario, respuestaBot) {
+  const h = historial[numero] || { mensajes: [], ts: Date.now() };
+  h.mensajes.push({ role: 'user', content: mensajeUsuario });
+  h.mensajes.push({ role: 'assistant', content: respuestaBot });
+  // Nos quedamos solo con los últimos MAX_MENSAJES
+  if (h.mensajes.length > MAX_MENSAJES) {
+    h.mensajes = h.mensajes.slice(-MAX_MENSAJES);
+  }
+  h.ts = Date.now();
+  historial[numero] = h;
+}
+
 // Autenticación de Google (misma cuenta de servicio para Sheets y Calendar)
 const googleAuth = new google.auth.GoogleAuth({
   credentials: JSON.parse(GOOGLE_CREDENTIALS || '{}'),
@@ -54,18 +89,20 @@ const SYSTEM_PROMPT = `Sos un asistente personal por WhatsApp para Gabi y su esp
 
 Tu trabajo es leer el mensaje, entender la intención (aunque esté escrita de mil formas distintas) y devolver SIEMPRE un JSON válido, sin texto adicional ni markdown.
 
-────────────────────────
+IMPORTANTE SOBRE EL CONTEXTO: te paso los mensajes anteriores de la conversación. Usalos para entender respuestas cortas. Por ejemplo, si vos preguntaste "¿1 hora o 30 minutos?" y la persona responde "1 hora", entendé que se refiere al evento que estaban armando y completá la acción con TODOS los datos que ya se dijeron antes. No vuelvas a preguntar algo que la persona ya respondió en un mensaje anterior.
+
+─────────────────────────
 ACCIÓN "gasto" — registrar un gasto
-────────────────────────
+─────────────────────────
 Ejemplos de cómo puede venir: "gasté 3000 en el súper con santander", "cargá 15 lucas de nafta MP-SOSA", "pagué 5000 a Pilu con galicia", "20k farmacia efectivo".
 
 CATEGORÍAS VÁLIDAS (elegí exactamente una, tal cual): Combustibles, Gastos Gabi, Compras casa, Gastos varios, Lauti, Pilu, Servicios hogar, Tarjetas y créditos, Vehículos, Viajes.
 MEDIOS DE PAGO VÁLIDOS (elegí exactamente uno): MP-SOSA, MP-PILAU, Santander, Efectivo, BBVA Net Cash, BBVA SOSA, Galicia.
 Reglas: nafta/gasoil = "Combustibles"; service/patente/seguro/cubiertas/arreglos = "Vehículos"; "Gastos Gabi" = cosas personales de Gabi; "Gastos varios" = cajón para lo que no encaja. Moneda "Pesos" por defecto, "US$" si dice dólares/usd. Montos informales: "15 lucas"/"15k" = 15000. Monto como número sin símbolos.
 
-────────────────────────
+─────────────────────────
 ACCIÓN "agendar" — crear un evento en el calendario
-────────────────────────
+─────────────────────────
 Cubre reuniones, turnos, eventos, recordatorios de pago y CUMPLEAÑOS.
 Ejemplos: "agendá reunión con proveedor el jueves a las 15", "turno con Rodri mañana 10:30", "recordame pagar la luz el 10", "esta semana tengo que pagar expensas", "anotá cumple de Pili el 20 de marzo", "recordame el service del auto el viernes que viene".
 
@@ -75,9 +112,9 @@ Reglas de interpretación:
 - CUMPLEAÑOS: si el mensaje dice "cumple", "cumpleaños" o similar, poné es_cumple = true (se repetirá todos los años) y all_day = true.
 - RECORDATORIO: si pide un aviso ("recordámelo 1 hora antes", "avisame 2 días antes", "1 día antes"), convertilo a minutos en recordatorio_minutos (1 hora = 60, 1 día = 1440, 30 min = 30, 10 días = 14400). Si no pide, dejá recordatorio_minutos = null.
 
-────────────────────────
+─────────────────────────
 ACCIÓN "consultar" — leer la agenda
-────────────────────────
+─────────────────────────
 Ejemplos: "¿qué tengo mañana?", "qué hay esta semana", "quién cumple este mes", "agenda de hoy", "tengo algo el viernes?".
 Definí un rango con rango_desde y rango_hasta (fechas YYYY-MM-DD) según lo que pida:
 - "hoy" → desde y hasta = hoy.
@@ -87,14 +124,14 @@ Definí un rango con rango_desde y rango_hasta (fechas YYYY-MM-DD) según lo que
 - un día puntual ("el viernes") → desde y hasta = ese día.
 Si es específicamente sobre cumpleaños, poné solo_cumples = true.
 
-────────────────────────
+─────────────────────────
 ACCIÓN "charla" — nada de lo anterior
-────────────────────────
+─────────────────────────
 Un saludo, una pregunta suelta, algo que no entendés. Respondé amable, con ganas de aprender, recordando qué sabés hacer.
 
-────────────────────────
+─────────────────────────
 FORMATO DE RESPUESTA (JSON exacto)
-────────────────────────
+─────────────────────────
 {
   "accion": "gasto" | "agendar" | "consultar" | "charla",
   "completo": true | false,
@@ -129,12 +166,16 @@ function extraerJSON(texto) {
   return JSON.parse(limpio.slice(ini, fin + 1));
 }
 
-async function interpretar(mensaje) {
+async function interpretar(mensaje, historialUsuario) {
+  // Armamos la conversación: primero los mensajes anteriores (contexto),
+  // y al final el mensaje nuevo de la persona.
+  const mensajes = [...historialUsuario, { role: 'user', content: mensaje }];
+
   const resp = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 700,
     system: `${SYSTEM_PROMPT}\n\nAhora es ${fechaHoyAR()} (zona horaria de Argentina).`,
-    messages: [{ role: 'user', content: mensaje }],
+    messages: mensajes,
   });
   const bloque = resp.content.find((b) => b.type === 'text');
   return extraerJSON(bloque.text);
@@ -268,7 +309,12 @@ app.post('/webhook', async (req, res) => {
     const nombre = allowedUsers[numero];
     if (!nombre) return; // número no autorizado → se ignora
 
-    const r = await interpretar(data.body || '');
+    const mensajeUsuario = data.body || '';
+
+    // Traemos el contexto de los mensajes anteriores de esta persona
+    const contexto = obtenerHistorial(numero);
+
+    const r = await interpretar(mensajeUsuario, contexto);
     let respuesta = r.respuesta;
 
     if (r.completo) {
@@ -280,6 +326,9 @@ app.post('/webhook', async (req, res) => {
         respuesta = await consultarAgenda(r.consulta);
       }
     }
+
+    // Guardamos este intercambio en la memoria de la persona
+    guardarEnHistorial(numero, mensajeUsuario, respuesta);
 
     await enviarWhatsApp(numero, respuesta);
   } catch (err) {
