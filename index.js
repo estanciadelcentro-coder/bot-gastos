@@ -205,7 +205,7 @@ async function anotarGasto(gasto, cargadoPor) {
 }
 
 // ── AGENDAR ──
-async function agendarEvento(ev) {
+async function agendarEvento(ev, numero) {
   const evento = { summary: ev.titulo };
 
   if (ev.all_day) {
@@ -227,6 +227,10 @@ async function agendarEvento(ev) {
   // Varios recordatorios (Google permite hasta 5)
   const avisos = (Array.isArray(ev.recordatorios_minutos) ? ev.recordatorios_minutos : [])
     .map(Number).filter((m) => Number.isFinite(m) && m >= 0).slice(0, 5);
+  // Guardamos en el evento a quién avisar y cuándo (los avisos llegan por WhatsApp)
+  if (avisos.length) {
+    evento.extendedProperties = { private: { avisos: avisos.join(','), numero: String(numero || '') } };
+  }
   if (avisos.length) {
     evento.reminders = {
       useDefault: false,
@@ -324,6 +328,64 @@ async function transcribirAudio(urlAudio) {
   return json.text || '';
 }
 
+// ── RECORDATORIOS POR WHATSAPP ──
+// Cada minuto miramos los eventos de los próximos días que tengan avisos,
+// y si a alguno le toca aviso en este minuto, mandamos el WhatsApp.
+let ultimoChequeo = Date.now();
+let revisando = false;
+const avisosEnviados = new Set();
+
+function textoFaltan(m) {
+  if (m <= 0) return 'ahora';
+  if (m < 60) return `en ${m} min`;
+  if (m < 1440) { const h = Math.round(m / 60); return `en ${h} hora${h > 1 ? 's' : ''}`; }
+  const d = Math.round(m / 1440); return d === 1 ? 'mañana' : `en ${d} días`;
+}
+
+async function revisarAvisos() {
+  if (revisando || !CALENDAR_ID) return;
+  revisando = true;
+  const desde = ultimoChequeo;
+  const ahora = Date.now();
+  ultimoChequeo = ahora;
+  try {
+    const res = await calendar.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: new Date(ahora - 60 * 1000).toISOString(),
+      timeMax: new Date(ahora + 8 * 24 * 3600 * 1000).toISOString(),
+      singleEvents: true,
+      maxResults: 250,
+    }, { timeout: 20000 });
+
+    for (const e of res.data.items || []) {
+      const priv = (e.extendedProperties && e.extendedProperties.private) || {};
+      if (!priv.avisos || !priv.numero) continue;
+      const todoElDia = !!e.start.date;
+      const inicio = todoElDia
+        ? new Date(`${e.start.date}T00:00:00-03:00`).getTime()
+        : new Date(e.start.dateTime).getTime();
+
+      for (const m of priv.avisos.split(',').map(Number)) {
+        const momento = inicio - m * 60 * 1000;
+        const clave = `${e.id}|${m}`;
+        if (momento > desde && momento <= ahora && !avisosEnviados.has(clave)) {
+          avisosEnviados.add(clave);
+          const cuando = todoElDia ? formatearFecha(e.start.date) : formatearFechaHora(e.start.dateTime);
+          const texto = todoElDia
+            ? `⏰ Recordatorio: ${e.summary} · ${cuando}`
+            : `⏰ Recordatorio: ${e.summary} · ${cuando} · ${textoFaltan(m)}`;
+          console.log('🕵️ [aviso] Enviando:', texto, 'a', priv.numero);
+          await enviarWhatsApp(priv.numero, texto);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error revisando avisos:', err.message);
+  } finally {
+    revisando = false;
+  }
+}
+
 // ── RUTAS ──
 app.get('/', (req, res) => res.send('Bot de gastos + agenda funcionando ✅'));
 
@@ -373,7 +435,7 @@ app.post('/webhook', async (req, res) => {
         if (r.accion === 'gasto') {
           await anotarGasto(r.gasto, nombre);
         } else if (r.accion === 'agendar') {
-          await agendarEvento(r.evento);
+          await agendarEvento(r.evento, numero);
         } else if (r.accion === 'consultar') {
           respuesta = await consultarAgenda(r.consulta);
         }
@@ -403,4 +465,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot escuchando en el puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Bot escuchando en el puerto ${PORT}`);
+  setInterval(revisarAvisos, 60 * 1000); // revisa los recordatorios cada minuto
+});
