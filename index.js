@@ -27,6 +27,7 @@ const {
   SHEET_TAB = 'Cargar',
   CALENDAR_ID,
   ALLOWED = '',
+  GROQ_API_KEY,
 } = process.env;
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
@@ -110,7 +111,8 @@ Reglas de interpretación:
 - Fecha/hora: interpretá lenguaje natural ("mañana", "el jueves", "en 2 semanas", "el 10", "a las 3 de la tarde" = 15:00). Usá la fecha/hora de HOY (te la doy abajo) como referencia.
 - Si NO menciona hora, es un evento de día completo (all_day = true).
 - CUMPLEAÑOS: si el mensaje dice "cumple", "cumpleaños" o similar, poné es_cumple = true (se repetirá todos los años) y all_day = true.
-- RECORDATORIO: si pide un aviso ("recordámelo 1 hora antes", "avisame 2 días antes", "1 día antes"), convertilo a minutos en recordatorio_minutos (1 hora = 60, 1 día = 1440, 30 min = 30, 10 días = 14400). Si no pide, dejá recordatorio_minutos = null.
+- RECORDATORIOS: SOLO si la persona pide avisos en el mensaje. Puede pedir uno o varios ("avisame 1 hora antes", "recordámelo 30 min, 1 hora y 1 día antes", "con los avisos de siempre" = 30 min, 1 hora y 1 día). Convertí cada uno a minutos y ponelos en la lista recordatorios_minutos (30 min = 30, 1 hora = 60, 2 horas = 120, 1 día = 1440, 2 días = 2880, 1 semana = 10080). Máximo 5. Si NO pide avisos, dejá recordatorios_minutos = [] (lista vacía) y NO preguntes por avisos.
+- En eventos de día completo (sin hora), "1 día antes" significa el día anterior a las 9:00 → usá 900 minutos; "el mismo día" → usá 0.
 
 ─────────────────────────
 ACCIÓN "consultar" — leer la agenda
@@ -136,7 +138,7 @@ FORMATO DE RESPUESTA (JSON exacto)
   "accion": "gasto" | "agendar" | "consultar" | "charla",
   "completo": true | false,
   "gasto": { "fecha": "DD/MM/AAAA"|null, "monto": número|null, "moneda": "Pesos"|"US$"|null, "categoria": null, "medio_pago": null, "detalle": null },
-  "evento": { "titulo": string|null, "fecha": "YYYY-MM-DD"|null, "hora_inicio": "HH:MM"|null, "hora_fin": "HH:MM"|null, "all_day": true|false, "es_cumple": true|false, "recordatorio_minutos": número|null },
+  "evento": { "titulo": string|null, "fecha": "YYYY-MM-DD"|null, "hora_inicio": "HH:MM"|null, "hora_fin": "HH:MM"|null, "all_day": true|false, "es_cumple": true|false, "recordatorios_minutos": [números] },
   "consulta": { "rango_desde": "YYYY-MM-DD"|null, "rango_hasta": "YYYY-MM-DD"|null, "solo_cumples": true|false },
   "respuesta": "texto que se le envía al usuario por WhatsApp"
 }
@@ -147,7 +149,7 @@ Reglas del JSON:
 - Si es un gasto/evento pero falta un dato esencial (ej: falta el medio de pago, o falta la fecha del evento): completo=false, llená lo que puedas, y en "respuesta" preguntá SOLO por lo que falta.
 - En "respuesta", cuando la acción esté completa, poné una confirmación cortita y clara:
   · gasto → "✅ Anotado: \$15.000 · Combustibles · Santander"
-  · agendar → "📅 Agendado: Turno con Rodri · jue 18/09 15:00 · te aviso 1h antes"
+  · agendar → "📅 Agendado: Turno con Rodri · jue 18/09 15:00 · avisos: 1 día, 1 h y 30 min antes" (si no hay avisos, no los menciones)
   · consultar → dejá "respuesta" con un texto breve tipo "Buscando tu agenda..." (el sistema completará el detalle real después).
 - charla → mensaje amable. Ej: "¡Hola! 👋 Puedo anotarte gastos y manejar tu agenda. Probá con 'gasté 3000 en el súper con Santander' o 'agendá turno con Rodri mañana 15hs'. 😉"`;
 
@@ -222,10 +224,13 @@ async function agendarEvento(ev) {
     evento.end = { dateTime: `${ev.fecha}T${horaFin}:00`, timeZone: TIMEZONE };
   }
 
-  if (ev.recordatorio_minutos) {
+  // Varios recordatorios (Google permite hasta 5)
+  const avisos = (Array.isArray(ev.recordatorios_minutos) ? ev.recordatorios_minutos : [])
+    .map(Number).filter((m) => Number.isFinite(m) && m >= 0).slice(0, 5);
+  if (avisos.length) {
     evento.reminders = {
       useDefault: false,
-      overrides: [{ method: 'popup', minutes: ev.recordatorio_minutos }],
+      overrides: avisos.map((m) => ({ method: 'popup', minutes: m })),
     };
   }
 
@@ -300,6 +305,25 @@ async function enviarWhatsApp(to, body) {
   console.log('🕵️ [5] UltraMsg contestó:', JSON.stringify(r.data));
 }
 
+// ── AUDIOS: pasar de voz a texto con Groq (Whisper) ──
+async function transcribirAudio(urlAudio) {
+  if (!GROQ_API_KEY) throw new Error('Falta la variable GROQ_API_KEY');
+  if (!urlAudio) throw new Error('El audio no trae enlace (media)');
+  const audio = await axios.get(urlAudio, { responseType: 'arraybuffer', timeout: 20000 });
+  const form = new FormData();
+  form.append('file', new Blob([audio.data], { type: 'audio/ogg' }), 'audio.ogg');
+  form.append('model', 'whisper-large-v3-turbo');
+  form.append('language', 'es');
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: form,
+  });
+  const json = await r.json();
+  if (!r.ok) throw new Error(json.error ? json.error.message : `Groq respondió ${r.status}`);
+  return json.text || '';
+}
+
 // ── RUTAS ──
 app.get('/', (req, res) => res.send('Bot de gastos + agenda funcionando ✅'));
 
@@ -310,13 +334,32 @@ app.post('/webhook', async (req, res) => {
   try {
     const data = req.body.data;
     console.log('🕵️ [0] Llegó webhook:', data ? `tipo=${data.type} fromMe=${data.fromMe} de=${data.from}` : 'sin datos');
-    if (!data || data.fromMe || data.type !== 'chat') return;
+    const esAudio = data && (data.type === 'ptt' || data.type === 'audio');
+    if (!data || data.fromMe || (data.type !== 'chat' && !esAudio)) return;
 
     numero = String(data.from).split('@')[0];
     const nombre = allowedUsers[numero];
     if (!nombre) { console.log('🕵️ Número no autorizado:', numero); return; }
 
-    const mensajeUsuario = data.body || '';
+    let mensajeUsuario = data.body || '';
+    let prefijoAudio = '';
+    if (esAudio) {
+      console.log('🕵️ [0b] Es un audio, transcribiendo:', data.media);
+      try {
+        mensajeUsuario = await transcribirAudio(data.media);
+        console.log('🕵️ [0c] Transcripción:', mensajeUsuario);
+      } catch (e) {
+        console.error('Error transcribiendo audio:', e.message);
+        await enviarWhatsApp(numero, '🎤 No pude escuchar bien el audio. ¿Me lo mandás de nuevo o por escrito?');
+        return;
+      }
+      if (!mensajeUsuario.trim()) {
+        await enviarWhatsApp(numero, '🎤 El audio me llegó vacío. ¿Me lo repetís?');
+        return;
+      }
+      // Le mostramos lo que entendió, para que pueda chequear
+      prefijoAudio = `🎤 _${mensajeUsuario.trim()}_\n\n`;
+    }
     console.log('🕵️ [1] Llegó mensaje de', nombre, ':', mensajeUsuario);
 
     // Traemos el contexto de los mensajes anteriores de esta persona
@@ -345,7 +388,7 @@ app.post('/webhook', async (req, res) => {
     // (se guarda en formato JSON para que Claude siga respondiendo en su formato)
     guardarEnHistorial(numero, mensajeUsuario, JSON.stringify({ ...r, respuesta }));
 
-    await enviarWhatsApp(numero, respuesta);
+    await enviarWhatsApp(numero, prefijoAudio + respuesta);
   } catch (err) {
     console.error('Error procesando mensaje:', err.message);
     // Avisamos también por WhatsApp para no quedar mudos
